@@ -17,6 +17,13 @@ when the response to a mutating `tools/call` is lost and the client retries, the
 | D1 | ledger written AFTER the effect; handler fails between effect and ledger write | 2 effects in 20/20 (the ledger does not help) |
 | D2 | key reserved BEFORE the effect; handler fails between effect and result write | 1 effect in 20/20, but the retry never gets a result (stuck "in progress") |
 | E | same key, different arguments | 1 effect in 20/20; the second call is rejected |
+| F0 | two-phase handler (reserve key, call downstream, record), downstream called WITHOUT a derived key; failure after the downstream call | 2 effects in 20/20 |
+| F | same, but a key derived from the caller's key (`<key>:charge`) is passed to the downstream system, which deduplicates | 1 effect in 20/20; the retry completes and gets the result |
+| G | F with the downstream unreachable on the first retry | 1 effect in 20/20; call sequence is always error, then a distinct `unknown` result (not an error, no hang), then `charged` after a reconcile retry |
+
+F and G follow the pattern suggested in the upstream issue discussion (atomic phases with recovery points; derive a key for each external call; distinct outcome for "key reserved, result unknown"). They are my implementation of that idea on a toy "downstream" table, not a general proof. G's `unknown` result is a convention of this toy tool, not something the protocol defines.
+
+D1 and D2 show the limit: when the failure falls between the effect and the record of it, a ledger inside the server cannot tell whether the effect happened. Resolving that needs the external system to take part (a lookup by key, or its own idempotency key).
 
 ### HTTP, spec revision 2026-07-28 (`lab_http.py`)
 Streamable HTTP, stateless (no `initialize`, no `Mcp-Session-Id`); the client reports protocol `2026-07-28`. The loss is injected at the HTTP layer: an ASGI middleware lets the real server handle the first `tools/call` per logical key (effect committed), discards the response and holds the connection until the client times out. The client retries once and the SDK sends a new JSON-RPC id.
@@ -27,14 +34,6 @@ Streamable HTTP, stateless (no `initialize`, no `Mcp-Session-Id`); the client re
 | B (ledger, caller-chosen key) | 1 effect in 20/20 |
 
 So the duplicate also happens on the stateless 2026-07-28 wire, where the spec says clients re-issue lost requests with a new request id. Raw output: `result_http_A.txt`, `result_http_B.txt`. Only A and B were run over HTTP.
-
-| F0 | two-phase handler (reserve key, call downstream, record), downstream called WITHOUT a derived key; failure after the downstream call | 2 effects in 20/20 |
-| F | same, but a key derived from the caller's key (`<key>:charge`) is passed to the downstream system, which deduplicates | 1 effect in 20/20; the retry completes and gets the result |
-| G | F with the downstream unreachable on the first retry | 1 effect in 20/20; call sequence is always error, then a distinct `unknown` result (not an error, no hang), then `charged` after a reconcile retry |
-
-F and G follow the pattern suggested in the upstream issue discussion (atomic phases with recovery points; derive a key for each external call; distinct outcome for "key reserved, result unknown"). They are my implementation of that idea on a toy "downstream" table, not a general proof. G's `unknown` result is a convention of this toy tool, not something the protocol defines.
-
-D1 and D2 show the limit: when the failure falls between the effect and the record of it, a ledger inside the server cannot tell whether the effect happened. Resolving that needs the external system to take part (a lookup by key, or its own idempotency key).
 
 Raw output: `result_<scenario>.txt`.
 
