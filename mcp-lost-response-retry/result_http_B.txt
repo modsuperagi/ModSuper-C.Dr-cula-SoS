@@ -1,0 +1,4 @@
+negotiated protocol: 2026-07-28
+http scenario=B runs=20 effects_per_logical_op={1: 20}
+attempts_per_run=[2] responses_dropped_total=20
+expected_effects=1 -> PASS

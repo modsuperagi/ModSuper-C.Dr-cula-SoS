@@ -18,6 +18,16 @@ when the response to a mutating `tools/call` is lost and the client retries, the
 | D2 | key reserved BEFORE the effect; handler fails between effect and result write | 1 effect in 20/20, but the retry never gets a result (stuck "in progress") |
 | E | same key, different arguments | 1 effect in 20/20; the second call is rejected |
 
+### HTTP, spec revision 2026-07-28 (`lab_http.py`)
+Streamable HTTP, stateless (no `initialize`, no `Mcp-Session-Id`); the client reports protocol `2026-07-28`. The loss is injected at the HTTP layer: an ASGI middleware lets the real server handle the first `tools/call` per logical key (effect committed), discards the response and holds the connection until the client times out. The client retries once and the SDK sends a new JSON-RPC id.
+
+| Scenario | Result (20 runs each) |
+|---|---|
+| A (no ledger) | 2 effects in 20/20 |
+| B (ledger, caller-chosen key) | 1 effect in 20/20 |
+
+So the duplicate also happens on the stateless 2026-07-28 wire, where the spec says clients re-issue lost requests with a new request id. Raw output: `result_http_A.txt`, `result_http_B.txt`. Only A and B were run over HTTP.
+
 D1 and D2 show the limit: when the failure falls between the effect and the record of it, a ledger inside the server cannot tell whether the effect happened. Resolving that needs the external system to take part (a lookup by key, or its own idempotency key).
 
 Raw output: `result_<scenario>.txt`.
@@ -27,10 +37,11 @@ Raw output: `result_<scenario>.txt`.
 pip install "mcp==2.2.0" "psycopg[binary]"
 # needs a Postgres database; set LAB_DSN (default: "dbname=lab")
 for s in A B C D1 D2 E; do python lab.py --scenario $s --runs 20; done
+for s in A B; do python lab_http.py --scenario $s --runs 20; done   # HTTP, 2026-07-28
 ```
 
 ## Limits (read before citing)
-- In-memory transport only, `mcp` Python SDK 2.2.0. Not yet run over HTTP or against spec revision 2026-07-28.
+- `mcp` Python SDK 2.2.0 only. Scenarios A-E run on the in-memory transport; A and B also over HTTP on 2026-07-28. The message loss is injected by my own code (transport wrapper / ASGI middleware), not by a real network failure. Other SDKs and servers were not tested.
 - B works because the caller chooses the key and the tool checks it. It needs the tool to expose a key. It does not make a tool idempotent when the key is missing.
 - C, D1, D2 and E are simulations of failure points inside my own toy server (the failure is raised in code, not a real process crash).
 - Single machine, 20 runs per scenario. A 'PASS' means the result matched what I expected, including for D1 and D2 where the expected result is a failure to prevent duplicates.
