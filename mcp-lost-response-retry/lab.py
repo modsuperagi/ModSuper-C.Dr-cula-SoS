@@ -3,6 +3,10 @@
 Scenarios (in-memory transport, mcp Python SDK):
   A  no ledger: tool commits an effect on every execution
   B  ledger:    tool checks a unique logical key (Postgres) before acting
+  C  B with 3 concurrent calls carrying the same key (no fault)
+  D1 ledger written AFTER the effect; handler fails between effect and ledger write
+  D2 key reserved BEFORE the effect; handler fails between effect and result write
+  E  same key reused with different arguments
 
 Fault injected: the response to the FIRST tools/call is dropped on its way back
 to the client, after the server handler has already returned (effect committed).
@@ -19,6 +23,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 import uuid
 
 import anyio
@@ -53,34 +58,56 @@ def count_effects(run: str) -> int:
         return c.execute("select count(*) from effects where run=%s", (run,)).fetchone()[0]
 
 
-def make_server(mode: str, run: str, crash_before_ledger: bool = False) -> MCPServer:
+def _charge_sync(mode: str, run: str, amount: int, key: str, state: dict) -> str:
+    first = not state.get("crashed")
+    out = json.dumps({"status": "charged", "amount": amount})
+    h = hashlib.sha256(json.dumps({"amount": amount}).encode()).hexdigest()
+    if mode == "A":
+        with db() as c:
+            c.execute("insert into effects(run, logical_key) values (%s, %s)", (run, key))
+        return out
+    if mode == "D1":  # check ledger, act, THEN record
+        with db() as c:
+            prev = c.execute("select result from ops where logical_key=%s", (key,)).fetchone()
+            if prev:
+                return prev[0]
+            c.execute("insert into effects(run, logical_key) values (%s, %s)", (run, key))
+            if first:
+                state["crashed"] = True
+                raise RuntimeError("simulated failure between effect and ledger write")
+            c.execute("insert into ops(logical_key, args_hash, result) values (%s,%s,%s)",
+                      (key, h, json.dumps(out)))
+            return out
+    # B, C, D2, E: reserve key, act, record result
+    with db() as c:
+        row = c.execute(
+            "insert into ops(logical_key, args_hash) values (%s, %s) "
+            "on conflict do nothing returning logical_key", (key, h)).fetchone()
+        if row is None:  # key seen before
+            prev = c.execute("select args_hash, result from ops where logical_key=%s", (key,)).fetchone()
+            if prev[0] != h:
+                raise ValueError("idempotency key reused with different arguments")
+            if prev[1] is None:
+                raise RuntimeError("operation in progress")
+            return prev[1]
+        c.execute("insert into effects(run, logical_key) values (%s, %s)", (run, key))
+        if mode == "C":
+            time.sleep(0.05)  # widen the race window
+        if mode == "D2" and first:
+            state["crashed"] = True
+            raise RuntimeError("simulated failure between effect and result write")
+        c.execute("update ops set result=%s where logical_key=%s", (json.dumps(out), key))
+        return out
+
+
+def make_server(mode: str, run: str) -> MCPServer:
     server = MCPServer("lab")
+    state: dict = {}
 
     @server.tool()
-    def charge(amount: int, key: str = "") -> str:
+    async def charge(amount: int, key: str = "") -> str:
         """Non-idempotent: records one effect per execution."""
-        if mode == "A":
-            with db() as c:
-                c.execute("insert into effects(run, logical_key) values (%s, %s)", (run, key))
-            return json.dumps({"status": "charged", "amount": amount})
-
-        # mode B: ledger keyed by the logical operation key
-        h = hashlib.sha256(json.dumps({"amount": amount}).encode()).hexdigest()
-        with db() as c:
-            row = c.execute(
-                "insert into ops(logical_key, args_hash) values (%s, %s) "
-                "on conflict do nothing returning logical_key", (key, h)).fetchone()
-            if row is None:  # key seen before
-                prev = c.execute("select args_hash, result from ops where logical_key=%s", (key,)).fetchone()
-                if prev[0] != h:
-                    raise ValueError("idempotency key reused with different arguments")
-                if prev[1] is None:
-                    raise RuntimeError("operation in progress")
-                return prev[1]
-            c.execute("insert into effects(run, logical_key) values (%s, %s)", (run, key))
-            out = json.dumps({"status": "charged", "amount": amount})
-            c.execute("update ops set result=%s where logical_key=%s", (json.dumps(out), key))
-            return out
+        return await asyncio.to_thread(_charge_sync, mode, run, amount, key, state)
 
     return server
 
@@ -131,40 +158,70 @@ class DropFirstResponse:
         return await self.inner.__aexit__(*a)
 
 
-async def one_run(mode: str, timeout: float) -> tuple[int, int, int]:
+async def call(client, args, timeout):
+    """One attempt. Returns (ok, text). A lost response or a tool error is a failure."""
+    try:
+        r = await client.call_tool("charge", args, read_timeout_seconds=timeout)
+    except Exception as e:
+        return False, type(e).__name__
+    text = "".join(getattr(c, "text", "") for c in r.content)
+    return (not r.is_error), text
+
+
+async def one_run(mode: str, timeout: float) -> dict:
     run = uuid.uuid4().hex
     key = f"op-{run}"  # logical operation key, chosen once by the caller
-    tr = DropFirstResponse(InMemoryTransport(make_server(mode, run)))
-    attempts = 0
+    srv = make_server("B" if mode == "E" else mode, run)
+    fault = mode in ("A", "B")
+    tr = DropFirstResponse(InMemoryTransport(srv))
+    if not fault:
+        tr.dropped = 1  # disable the drop
+    attempts, outcomes = 0, []
     async with Client(tr) as client:
-        for _ in range(2):  # first try + one retry
-            attempts += 1
-            try:
-                await client.call_tool("charge", {"amount": 100, "key": key},
-                                       read_timeout_seconds=timeout)
-                break
-            except Exception as e:  # timeout of the lost response
-                last = e
-    return count_effects(run), attempts, tr.dropped
+        if mode == "C":
+            res = await asyncio.gather(*[call(client, {"amount": 100, "key": key}, 10) for _ in range(3)])
+            outcomes = [ok for ok, _ in res]; attempts = 3
+        elif mode == "E":
+            outcomes.append((await call(client, {"amount": 100, "key": key}, 10))[0])
+            outcomes.append((await call(client, {"amount": 200, "key": key}, 10))[0])
+            attempts = 2
+        else:  # A, B, D1, D2: first try + one retry with the SAME key
+            for _ in range(2):
+                attempts += 1
+                ok, _t = await call(client, {"amount": 100, "key": key}, timeout)
+                outcomes.append(ok)
+                if ok:
+                    break
+    return dict(effects=count_effects(run), attempts=attempts,
+                dropped=tr.dropped if fault else 0, final_ok=outcomes[-1],
+                n_ok=sum(outcomes))
+
+
+EXPECT = {  # scenario -> (expected effects, description of what PASS means)
+    "A": 2, "B": 1, "C": 1, "D1": 2, "D2": 1, "E": 1,
+}
 
 
 async def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scenario", choices=["A", "B"], required=True)
+    ap.add_argument("--scenario", choices=list(EXPECT), required=True)
     ap.add_argument("--runs", type=int, default=20)
     ap.add_argument("--timeout", type=float, default=1.0)
     a = ap.parse_args()
     reset()
-    effects, att, drp = [], [], []
-    for _ in range(a.runs):
-        n, attempts, dropped = await one_run(a.scenario, a.timeout)
-        effects.append(n); att.append(attempts); drp.append(dropped)
+    rs = [await one_run(a.scenario, a.timeout) for _ in range(a.runs)]
+    effects = [r["effects"] for r in rs]
     dist = {k: effects.count(k) for k in sorted(set(effects))}
     print(f"scenario={a.scenario} runs={a.runs} effects_per_logical_op={dist}")
-    print(f"attempts_per_run={sorted(set(att))} responses_dropped_per_run={sorted(set(drp))}")
-    expected = 2 if a.scenario == "A" else 1
+    print(f"attempts_per_run={sorted({r['attempts'] for r in rs})} "
+          f"responses_dropped_per_run={sorted({r['dropped'] for r in rs})} "
+          f"final_call_ok={sorted({r['final_ok'] for r in rs})} "
+          f"successful_calls_per_run={sorted({r['n_ok'] for r in rs})}")
+    expected = EXPECT[a.scenario]
     ok = all(n == expected for n in effects)
-    print(f"expected={expected} -> {'PASS' if ok else 'FAIL'}")
+    if a.scenario == "E":  # second call (different args) must be rejected
+        ok = ok and all(r["n_ok"] == 1 and not r["final_ok"] for r in rs)
+    print(f"expected_effects={expected} -> {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
 
