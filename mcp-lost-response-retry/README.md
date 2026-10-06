@@ -28,6 +28,12 @@ Streamable HTTP, stateless (no `initialize`, no `Mcp-Session-Id`); the client re
 
 So the duplicate also happens on the stateless 2026-07-28 wire, where the spec says clients re-issue lost requests with a new request id. Raw output: `result_http_A.txt`, `result_http_B.txt`. Only A and B were run over HTTP.
 
+| F0 | two-phase handler (reserve key, call downstream, record), downstream called WITHOUT a derived key; failure after the downstream call | 2 effects in 20/20 |
+| F | same, but a key derived from the caller's key (`<key>:charge`) is passed to the downstream system, which deduplicates | 1 effect in 20/20; the retry completes and gets the result |
+| G | F with the downstream unreachable on the first retry | 1 effect in 20/20; call sequence is always error, then a distinct `unknown` result (not an error, no hang), then `charged` after a reconcile retry |
+
+F and G follow the pattern suggested in the upstream issue discussion (atomic phases with recovery points; derive a key for each external call; distinct outcome for "key reserved, result unknown"). They are my implementation of that idea on a toy "downstream" table, not a general proof. G's `unknown` result is a convention of this toy tool, not something the protocol defines.
+
 D1 and D2 show the limit: when the failure falls between the effect and the record of it, a ledger inside the server cannot tell whether the effect happened. Resolving that needs the external system to take part (a lookup by key, or its own idempotency key).
 
 Raw output: `result_<scenario>.txt`.
@@ -36,14 +42,14 @@ Raw output: `result_<scenario>.txt`.
 ```
 pip install "mcp==2.2.0" "psycopg[binary]"
 # needs a Postgres database; set LAB_DSN (default: "dbname=lab")
-for s in A B C D1 D2 E; do python lab.py --scenario $s --runs 20; done
+for s in A B C D1 D2 E F0 F G; do python lab.py --scenario $s --runs 20; done
 for s in A B; do python lab_http.py --scenario $s --runs 20; done   # HTTP, 2026-07-28
 ```
 
 ## Limits (read before citing)
-- `mcp` Python SDK 2.2.0 only. Scenarios A-E run on the in-memory transport; A and B also over HTTP on 2026-07-28. The message loss is injected by my own code (transport wrapper / ASGI middleware), not by a real network failure. Other SDKs and servers were not tested.
+- `mcp` Python SDK 2.2.0 only. Scenarios A-G run on the in-memory transport; A and B also over HTTP on 2026-07-28. The message loss is injected by my own code (transport wrapper / ASGI middleware), not by a real network failure. Other SDKs and servers were not tested.
 - B works because the caller chooses the key and the tool checks it. It needs the tool to expose a key. It does not make a tool idempotent when the key is missing.
-- C, D1, D2 and E are simulations of failure points inside my own toy server (the failure is raised in code, not a real process crash).
+- C, D1, D2, E, F0, F and G are simulations of failure points inside my own toy server (the failure is raised in code, not a real process crash).
 - Single machine, 20 runs per scenario. A 'PASS' means the result matched what I expected, including for D1 and D2 where the expected result is a failure to prevent duplicates.
 
 ## Disclosure

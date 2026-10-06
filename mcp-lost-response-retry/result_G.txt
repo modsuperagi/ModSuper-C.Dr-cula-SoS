@@ -1,0 +1,4 @@
+scenario=G runs=20 effects_per_logical_op={1: 20}
+attempts_per_run=[3] responses_dropped_per_run=[0] final_call_ok=[True] successful_calls_per_run=[1]
+call_sequence=[('error', 'unknown', 'charged')]
+expected_effects=1 -> PASS

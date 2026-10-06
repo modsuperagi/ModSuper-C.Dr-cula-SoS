@@ -7,6 +7,10 @@ Scenarios (in-memory transport, mcp Python SDK):
   D1 ledger written AFTER the effect; handler fails between effect and ledger write
   D2 key reserved BEFORE the effect; handler fails between effect and result write
   E  same key reused with different arguments
+  F0 two-phase handler, downstream called WITHOUT a derived key; failure after the downstream call
+  F  same, but a key derived from the caller's key is passed to the downstream system
+  G  F with the downstream unreachable on the first retry: the server answers a distinct
+     'unknown outcome' result instead of an error or a hang; a later retry reconciles
 
 Fault injected: the response to the FIRST tools/call is dropped on its way back
 to the client, after the server handler has already returned (effect committed).
@@ -40,6 +44,8 @@ create table if not exists effects(
   id bigserial primary key, run text not null, logical_key text, at timestamptz default now());
 create table if not exists ops(
   logical_key text primary key, args_hash text not null, result jsonb);
+alter table ops add column if not exists phase text;
+create table if not exists downstream(idem_key text primary key);
 """
 
 
@@ -50,7 +56,7 @@ def db() -> psycopg.Connection:
 def reset() -> None:
     with db() as c:
         c.execute(SCHEMA)
-        c.execute("truncate effects, ops restart identity")
+        c.execute("truncate effects, ops, downstream restart identity")
 
 
 def count_effects(run: str) -> int:
@@ -77,6 +83,30 @@ def _charge_sync(mode: str, run: str, amount: int, key: str, state: dict) -> str
                 raise RuntimeError("simulated failure between effect and ledger write")
             c.execute("insert into ops(logical_key, args_hash, result) values (%s,%s,%s)",
                       (key, h, json.dumps(out)))
+            return out
+    if mode in ("F0", "F", "G"):  # two phases with a recovery point; downstream is a separate system
+        with db() as c:
+            row = c.execute(
+                "insert into ops(logical_key, args_hash, phase) values (%s, %s, 'started') "
+                "on conflict do nothing returning logical_key", (key, h)).fetchone()
+            if row is None:
+                prev = c.execute("select args_hash, phase, result from ops where logical_key=%s", (key,)).fetchone()
+                if prev[0] != h:
+                    raise ValueError("idempotency key reused with different arguments")
+                if prev[1] == "done":
+                    return prev[2]
+                if mode == "G" and state.get("down"):  # recovery point reached, downstream unreachable
+                    return json.dumps({"status": "unknown", "detail": "key reserved, result unknown; retry later or reconcile"})
+            dk = f"{key}:charge" if mode in ("F", "G") else uuid.uuid4().hex  # F0: no stable downstream key
+            new = c.execute("insert into downstream(idem_key) values (%s) on conflict do nothing returning 1", (dk,)).fetchone()
+            if new:
+                c.execute("insert into effects(run, logical_key) values (%s, %s)", (run, key))
+            if first:
+                state["crashed"] = True
+                if mode == "G":
+                    state["down"] = True
+                raise RuntimeError("simulated failure after the downstream call, before recording it")
+            c.execute("update ops set phase='done', result=%s where logical_key=%s", (json.dumps(out), key))
             return out
     # B, C, D2, E: reserve key, act, record result
     with db() as c:
@@ -109,6 +139,7 @@ def make_server(mode: str, run: str) -> MCPServer:
         """Non-idempotent: records one effect per execution."""
         return await asyncio.to_thread(_charge_sync, mode, run, amount, key, state)
 
+    server._lab_state = state
     return server
 
 
@@ -185,20 +216,30 @@ async def one_run(mode: str, timeout: float) -> dict:
             outcomes.append((await call(client, {"amount": 100, "key": key}, 10))[0])
             outcomes.append((await call(client, {"amount": 200, "key": key}, 10))[0])
             attempts = 2
-        else:  # A, B, D1, D2: first try + one retry with the SAME key
+        elif mode == "G":
+            texts = []
+            for i in range(3):
+                ok, t = await call(client, {"amount": 100, "key": key}, 10)
+                texts.append("error" if not ok else json.loads(t)["status"])
+                if i == 1:
+                    srv._lab_state["down"] = False  # downstream recovers before the reconcile attempt
+            outcomes = [ok for ok in [t == "charged" for t in texts]]; attempts = 3
+            seq = texts
+        else:  # A, B, D1, D2, F0, F: first try + one retry with the SAME key
             for _ in range(2):
                 attempts += 1
                 ok, _t = await call(client, {"amount": 100, "key": key}, timeout)
                 outcomes.append(ok)
                 if ok:
                     break
-    return dict(effects=count_effects(run), attempts=attempts,
+    seq = locals().get("seq")
+    return dict(seq=seq, effects=count_effects(run), attempts=attempts,
                 dropped=tr.dropped if fault else 0, final_ok=outcomes[-1],
                 n_ok=sum(outcomes))
 
 
 EXPECT = {  # scenario -> (expected effects, description of what PASS means)
-    "A": 2, "B": 1, "C": 1, "D1": 2, "D2": 1, "E": 1,
+    "A": 2, "B": 1, "C": 1, "D1": 2, "D2": 1, "E": 1, "F0": 2, "F": 1, "G": 1,
 }
 
 
@@ -221,6 +262,12 @@ async def main() -> int:
     ok = all(n == expected for n in effects)
     if a.scenario == "E":  # second call (different args) must be rejected
         ok = ok and all(r["n_ok"] == 1 and not r["final_ok"] for r in rs)
+    if a.scenario == "G":
+        print(f"call_sequence={sorted({tuple(r['seq']) for r in rs})}")
+    if a.scenario == "F":
+        ok = ok and all(r["final_ok"] for r in rs)
+    if a.scenario == "G":
+        ok = ok and all(r["seq"] == ["error", "unknown", "charged"] for r in rs)
     print(f"expected_effects={expected} -> {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
