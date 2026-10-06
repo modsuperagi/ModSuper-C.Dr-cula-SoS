@@ -9,12 +9,18 @@ Scenarios (in-memory transport, mcp Python SDK):
   E  same key reused with different arguments
   F0 two-phase handler, downstream called WITHOUT a derived key; failure after the downstream call
   F  same, but a key derived from the caller's key is passed to the downstream system
+  FC F with 3 concurrent calls on the same key, then one more call
   G  F with the downstream unreachable on the first retry: the server answers a distinct
      'unknown outcome' result instead of an error or a hang; a later retry reconciles
 
-Fault injected: the response to the FIRST tools/call is dropped on its way back
-to the client, after the server handler has already returned (effect committed).
-The client times out and retries ONCE; the SDK assigns a fresh JSON-RPC id.
+Faults differ per scenario:
+  A, B        the response to the FIRST tools/call is dropped on its way back to the client,
+              after the server handler has returned (effect committed). The client times out
+              and retries ONCE; the SDK assigns a fresh JSON-RPC id.
+  C           no fault, only concurrency.
+  D*, F*, G   the handler raises at a chosen point on its first execution (a tool error reaches
+              the client, which retries). This simulates a failure point; it is not a lost response.
+  E           no fault, a second call reuses the key with different arguments.
 
 Metric: effects committed per logical operation (expected 1).
 """
@@ -84,7 +90,7 @@ def _charge_sync(mode: str, run: str, amount: int, key: str, state: dict) -> str
             c.execute("insert into ops(logical_key, args_hash, result) values (%s,%s,%s)",
                       (key, h, json.dumps(out)))
             return out
-    if mode in ("F0", "F", "G"):  # two phases with a recovery point; downstream is a separate system
+    if mode in ("F0", "F", "FC", "G"):  # two phases with a recovery point; downstream is a separate system
         with db() as c:
             row = c.execute(
                 "insert into ops(logical_key, args_hash, phase) values (%s, %s, 'started') "
@@ -97,7 +103,7 @@ def _charge_sync(mode: str, run: str, amount: int, key: str, state: dict) -> str
                     return prev[2]
                 if mode == "G" and state.get("down"):  # recovery point reached, downstream unreachable
                     return json.dumps({"status": "unknown", "detail": "key reserved, result unknown; retry later or reconcile"})
-            dk = f"{key}:charge" if mode in ("F", "G") else uuid.uuid4().hex  # F0: no stable downstream key
+            dk = f"{key}:charge" if mode != "F0" else uuid.uuid4().hex  # F0: no stable downstream key
             new = c.execute("insert into downstream(idem_key) values (%s) on conflict do nothing returning 1", (dk,)).fetchone()
             if new:
                 c.execute("insert into effects(run, logical_key) values (%s, %s)", (run, key))
@@ -139,8 +145,7 @@ def make_server(mode: str, run: str) -> MCPServer:
         """Non-idempotent: records one effect per execution."""
         return await asyncio.to_thread(_charge_sync, mode, run, amount, key, state)
 
-    server._lab_state = state
-    return server
+    return server, state
 
 
 class DropFirstResponse:
@@ -199,19 +204,25 @@ async def call(client, args, timeout):
     return (not r.is_error), text
 
 
-async def one_run(mode: str, timeout: float) -> dict:
+async def one_run(mode: str, timeout: float, client_mode: str) -> dict:
     run = uuid.uuid4().hex
     key = f"op-{run}"  # logical operation key, chosen once by the caller
-    srv = make_server("B" if mode == "E" else mode, run)
+    srv, state = make_server("B" if mode == "E" else mode, run)
+    seq = None
     fault = mode in ("A", "B")
     tr = DropFirstResponse(InMemoryTransport(srv))
     if not fault:
         tr.dropped = 1  # disable the drop
     attempts, outcomes = 0, []
-    async with Client(tr) as client:
+    async with Client(tr, mode=client_mode) as client:
+        proto = client.protocol_version
         if mode == "C":
             res = await asyncio.gather(*[call(client, {"amount": 100, "key": key}, 10) for _ in range(3)])
             outcomes = [ok for ok, _ in res]; attempts = 3
+        elif mode == "FC":
+            res = await asyncio.gather(*[call(client, {"amount": 100, "key": key}, 10) for _ in range(3)])
+            outcomes = [ok for ok, _ in res]
+            outcomes.append((await call(client, {"amount": 100, "key": key}, 10))[0]); attempts = 4
         elif mode == "E":
             outcomes.append((await call(client, {"amount": 100, "key": key}, 10))[0])
             outcomes.append((await call(client, {"amount": 200, "key": key}, 10))[0])
@@ -222,8 +233,8 @@ async def one_run(mode: str, timeout: float) -> dict:
                 ok, t = await call(client, {"amount": 100, "key": key}, 10)
                 texts.append("error" if not ok else json.loads(t)["status"])
                 if i == 1:
-                    srv._lab_state["down"] = False  # downstream recovers before the reconcile attempt
-            outcomes = [ok for ok in [t == "charged" for t in texts]]; attempts = 3
+                    state["down"] = False  # downstream recovers before the reconcile attempt
+            outcomes = [t == "charged" for t in texts]; attempts = 3
             seq = texts
         else:  # A, B, D1, D2, F0, F: first try + one retry with the SAME key
             for _ in range(2):
@@ -232,15 +243,14 @@ async def one_run(mode: str, timeout: float) -> dict:
                 outcomes.append(ok)
                 if ok:
                     break
-    seq = locals().get("seq")
-    return dict(seq=seq, effects=count_effects(run), attempts=attempts,
+    return dict(proto=proto, seq=seq, effects=count_effects(run), attempts=attempts,
                 dropped=tr.dropped if fault else 0, final_ok=outcomes[-1],
                 n_ok=sum(outcomes))
 
 
-EXPECT = {  # scenario -> (expected effects, description of what PASS means)
-    "A": 2, "B": 1, "C": 1, "D1": 2, "D2": 1, "E": 1, "F0": 2, "F": 1, "G": 1,
-}
+# scenario -> expected effects per logical operation. PASS means "matched this number", which for
+# A, D1 and F0 is a demonstrated duplicate, not a success of the tool.
+EXPECT = {"A": 2, "B": 1, "C": 1, "D1": 2, "D2": 1, "E": 1, "F0": 2, "F": 1, "FC": 1, "G": 1}
 
 
 async def main() -> int:
@@ -248,9 +258,12 @@ async def main() -> int:
     ap.add_argument("--scenario", choices=list(EXPECT), required=True)
     ap.add_argument("--runs", type=int, default=20)
     ap.add_argument("--timeout", type=float, default=1.0)
+    ap.add_argument("--client-mode", default="auto",
+                    help="'auto' (default), 'legacy' (initialize handshake, e.g. 2025-11-25) or a version pin")
     a = ap.parse_args()
     reset()
-    rs = [await one_run(a.scenario, a.timeout) for _ in range(a.runs)]
+    rs = [await one_run(a.scenario, a.timeout, a.client_mode) for _ in range(a.runs)]
+    print(f"client_mode={a.client_mode} negotiated_protocol={sorted({r['proto'] for r in rs})}")
     effects = [r["effects"] for r in rs]
     dist = {k: effects.count(k) for k in sorted(set(effects))}
     print(f"scenario={a.scenario} runs={a.runs} effects_per_logical_op={dist}")
@@ -264,7 +277,7 @@ async def main() -> int:
         ok = ok and all(r["n_ok"] == 1 and not r["final_ok"] for r in rs)
     if a.scenario == "G":
         print(f"call_sequence={sorted({tuple(r['seq']) for r in rs})}")
-    if a.scenario == "F":
+    if a.scenario in ("F", "FC"):
         ok = ok and all(r["final_ok"] for r in rs)
     if a.scenario == "G":
         ok = ok and all(r["seq"] == ["error", "unknown", "charged"] for r in rs)

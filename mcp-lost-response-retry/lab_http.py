@@ -18,7 +18,6 @@ import uvicorn
 from mcp.client import Client
 from mcp.server.mcpserver import MCPServer
 
-import lab
 from lab import _charge_sync, count_effects, reset
 
 

@@ -1,4 +1,4 @@
-client_mode=auto negotiated_protocol=['2026-07-28']
+client_mode=legacy negotiated_protocol=['2025-11-25']
 scenario=A runs=20 effects_per_logical_op={2: 20}
 attempts_per_run=[2] responses_dropped_per_run=[1] final_call_ok=[True] successful_calls_per_run=[1]
 expected_effects=2 -> PASS
