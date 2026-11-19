@@ -1,0 +1,6 @@
+client_mode=auto negotiated_protocol=['2026-07-28']
+scenario=N runs=20 effects_per_logical_op={1: 20}
+attempts_per_run=[2] responses_dropped_per_run=[1] final_call_ok=[False] successful_calls_per_run=[0]
+after_commit_response_drop=True fresh_request_id_on_retry=True request_ids_example=(2, 3)
+client_visible_outcome=['retry rejected; original outcome unresolved']
+expected_effects=1 -> PASS

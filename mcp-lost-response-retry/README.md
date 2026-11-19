@@ -7,7 +7,7 @@ when the response to a mutating `tools/call` is lost and the client retries, the
 - Server tool `charge` is non-idempotent: it records one row per execution.
 - Metric: effects committed per logical operation (want 1).
 - Two different kinds of fault are used, and they are not the same thing:
-  - **Lost response** (A, B): the response to the first `tools/call` is dropped after the handler returned (effect already committed). The client times out and retries once; the SDK assigns a new request id. This is the case the issue describes.
+  - **Lost response** (A, B, R, N): the response to the first `tools/call` is dropped after the handler returned (effect already committed). The client times out and retries once; the SDK assigns a new request id. This is the case the issue describes.
   - **Failure point inside the handler** (D1, D2, F0, F, FC, G): the handler raises at a chosen point on its first execution, so the client gets a tool error and retries. This is used to place a failure between two steps. It is not a lost response.
 
 | Scenario | Description | Result (20 runs each) |
@@ -22,6 +22,10 @@ when the response to a mutating `tools/call` is lost and the client retries, the
 | F | same, but a key derived from the caller's key (`<key>:charge`) is passed to the downstream system, which deduplicates | 1 effect in 20/20; the retry completes and gets the result |
 | FC | F with 3 concurrent calls on the same key, then one more call | 1 effect in 20/20; the last call gets the result |
 | G | F with the downstream unreachable on the first retry | 1 effect in 20/20; call sequence is always error, then a distinct `unknown` result (not an error, no hang), then `charged` after a reconcile retry |
+| R | ledger stores the result on first execution; lost response, then retry with the same caller-chosen key and a fresh JSON-RPC id | 1 effect in 20/20; client-visible outcome: stored original result recovered (no second effect) |
+| N | nonce-only: ledger records the effect and consumes the key, but does not store the result; lost response, then retry with the same key | 1 effect in 20/20; client-visible outcome: retry rejected; original outcome unresolved (the rejected retry does not mean the original operation failed) |
+
+R and N use the same lost-response + fresh-id retry shape as A and B. They make a distinction that the effect count alone does not show: blocking a duplicate is not the same as giving the client a recovery path. In R the ledger stores the result of the first execution, so the retry returns that stored result. In N the ledger only consumes the key (a nonce); the retry is rejected and the original outcome stays unresolved. The runs also record the JSON-RPC request ids (the retry uses a fresh id) and that the dropped response is after the handler returned.
 
 F and G follow the pattern suggested in the upstream issue discussion (atomic phases with recovery points; derive a key for each external call; distinct outcome for "key reserved, result unknown"). They are my implementation of that idea on a toy "downstream" table, not a general proof. G's `unknown` result is a convention of this toy tool, not something the protocol defines. Simplifications to keep in mind: the "downstream" is a table in the same Postgres database, so its deduplication is a unique constraint and never fails or lags; "unreachable" in G is a flag the test flips, not a network failure; and in F a retry that finds the key in phase `started` simply calls the downstream again, which is safe only because the downstream deduplicates (FC checks that with concurrent calls).
 
@@ -42,23 +46,23 @@ One thing this test does not cover: on this transport, closing the response stre
 ### Protocol versions
 With the SDK's default client mode the in-memory runs negotiate `2026-07-28`. A and B were also run with `--client-mode legacy` (initialize handshake, negotiated `2025-11-25`, the version in the issue): same results, 2 effects and 1 effect in 20/20.
 
-Raw output: `result_<scenario>.txt`, `result_legacy_<A|B>.txt`, `result_http_<A|B>.txt`.
+Raw output: `result_<scenario>.txt` (including `result_R.txt` and `result_N.txt`), `result_legacy_<A|B>.txt`, `result_http_<A|B>.txt`.
 
 ## Run
 ```
 pip install "mcp==2.2.0" "psycopg[binary]"
 # needs a Postgres database; set LAB_DSN (default: "dbname=lab")
-for s in A B C D1 D2 E F0 F FC G; do python lab.py --scenario $s --runs 20; done
+for s in A B C D1 D2 E F0 F FC G R N; do python lab.py --scenario $s --runs 20; done
 for s in A B; do python lab.py --scenario $s --runs 20 --client-mode legacy; done   # 2025-11-25
 for s in A B; do python lab_http.py --scenario $s --runs 20; done   # HTTP, 2026-07-28
 ```
 
 ## Limits (read before citing)
-- `mcp` Python SDK 2.2.0 only. Scenarios A-G run on the in-memory transport; A and B also over HTTP on 2026-07-28. The message loss is injected by my own code (transport wrapper / ASGI middleware), not by a real network failure. Other SDKs and servers were not tested.
+- `mcp` Python SDK 2.2.0 only. Scenarios A–G, R and N run on the in-memory transport; A and B also over HTTP on 2026-07-28. R and N were not run over HTTP. The message loss is injected by my own code (transport wrapper / ASGI middleware), not by a real network failure. Other SDKs and servers were not tested.
 - B works because the caller chooses the key and the tool checks it. It needs the tool to expose a key. It does not make a tool idempotent when the key is missing.
 - D1, D2, F0, F, FC and G place the failure by raising an exception in my own toy server. That is not a real process crash and not a lost response; a real crash can also leave a transaction half-open, which this does not exercise.
 - A reserved key whose result is never written stays reserved forever here (D2). There is no expiry or lease, so this is not a complete design.
-- Single machine, 20 runs per scenario. A 'PASS' means the result matched what I expected, including for A, D1 and F0 where the expected result is a duplicate.
+- Single machine, 20 runs per scenario (R and N were also re-run several times). A 'PASS' means the result matched what I expected, including for A, D1 and F0 where the expected result is a duplicate. For R and N the assertion also covers the client-visible outcome, not only the effect count.
 
 ## Disclosure
 Written with AI assistance (Claude). Results come from the commands above; please re-run them rather than trust this text.
